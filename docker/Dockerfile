@@ -52,3 +52,5 @@ RUN python -c "import aphrodite; print(aphrodite.__version__)"
 ##############################################################################
 
 WORKDIR /app/aphrodite-engine
+
+ENTRYPOINT [ "/app/aphrodite-engine/docker/entrypoint.sh" ]

@@ -3,7 +3,7 @@
 set -xe
 
 echo 'Starting Aphrodite Engine API server...'
-CMD="python -u -m aphrodite.endpoints.kobold.api_server \
+CMD="python -u -m aphrodite.endpoints.openai.api_server \
              --host 0.0.0.0 \
              --port 7860 \
              --model $MODEL_NAME \
