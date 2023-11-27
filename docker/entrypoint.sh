@@ -2,8 +2,6 @@
 
 set -xe
 
-cd /app/aphrodite-engine
-source activate aphrodite-engine
 echo 'Starting Aphrodite Engine API server...'
 CMD="python -u -m aphrodite.endpoints.kobold.api_server \
              --host 0.0.0.0 \
