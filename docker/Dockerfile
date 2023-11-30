@@ -5,12 +5,15 @@ FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
 ##############################################################################
 ENV STAGE_DIR=/app
 ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0+PTX"
+ENV NVIDIA_VISIBLE_DEVICES all
+ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
+LABEL com.nvidia.volumes.needed="nvidia_driver"
 RUN mkdir -p ${STAGE_DIR}
 
 ##############################################################################
 # Requirements
 ##############################################################################
-RUN apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/                                                                                repos/ubuntu1804/x86_64/3bf863cc.pub
+RUN apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/3bf863cc.pub
 
 RUN apt-get update && apt-get -y dist-upgrade && apt-get -y upgrade && \
         apt-get install -y --no-install-recommends \
