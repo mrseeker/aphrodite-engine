@@ -1,33 +1,19 @@
+"""Utilities for selecting and loading models."""
 import contextlib
-from typing import Type
+import gc
+from contextlib import nullcontext
+from typing import Optional, Type
+from loguru import logger
+
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
 
-from aphrodite.common.config import ModelConfig
-from aphrodite.modeling.models import (LlamaForCausalLM, GPTJForCausalLM,
-                                       GPTNeoXForCausalLM, MistralForCausalLM,
-                                       YiForCausalLM)
-from aphrodite.modeling.hf_downloader import (initialize_dummy_weights,
-                                              get_quant_config)
-from aphrodite.modeling.layers.quantized_linear.utils import quant_post_init
-
-_MODEL_REGISTRY = {
-    "LlamaForCausalLM": LlamaForCausalLM,
-    "LLaMAForCausalLM": LlamaForCausalLM,
-    "GPTJForCausalLM": GPTJForCausalLM,
-    "GPTNeoXForCausalLM": GPTNeoXForCausalLM,
-    "MistralForCausalLM": MistralForCausalLM,
-    "YiForCausalLM": YiForCausalLM,
-}
-
-_MODEL_CLASSES_SUPPORT_QUANTIZATION = {
-    "awq": [LlamaForCausalLM, MistralForCausalLM, YiForCausalLM],
-    "gptq": [
-        LlamaForCausalLM, GPTJForCausalLM, GPTNeoXForCausalLM,
-        MistralForCausalLM, YiForCausalLM
-    ],
-}
+from aphrodite.common.config import DeviceConfig, ModelConfig, LoRAConfig
+from aphrodite.modeling.models import ModelRegistry
+from aphrodite.modeling.hf_downloader import (get_quant_config,
+                                              initialize_dummy_weights)
+from aphrodite.modeling.layers.quantization.bitsandbytes import (
+    BNBLinearMethod, replace_quant_params)
 
 
 @contextlib.contextmanager
@@ -39,30 +25,31 @@ def _set_default_torch_dtype(dtype: torch.dtype):
     torch.set_default_dtype(old_dtype)
 
 
-def _get_model_architecture(config: PretrainedConfig) -> Type[nn.Module]:
-    architectures = getattr(config, "architectures", [])
+def _get_model_architecture(model_config: ModelConfig) -> Type[nn.Module]:
+    architectures = getattr(model_config.hf_config, "architectures", [])
+    # Special handling for quantized Mixtral.
+    # FIXME: This is a temporary hack.
+    if (model_config.quantization is not None
+            and "MixtralForCausalLM" in architectures):
+        architectures = ["QuantMixtralForCausalLM"]
     for arch in architectures:
-        if arch in _MODEL_REGISTRY:
-            return _MODEL_REGISTRY[arch]
+        model_cls = ModelRegistry.load_model_cls(arch)
+        if model_cls is not None:
+            return model_cls
     raise ValueError(
         f"Model architectures {architectures} are not supported for now. "
-        f"Supported architectures: {list(_MODEL_REGISTRY.keys())}")
+        f"Supported architectures: {ModelRegistry.get_supported_archs()}")
 
 
-def get_model(model_config: ModelConfig, max_tokens: int) -> nn.Module:
-    model_class = _get_model_architecture(model_config.hf_config)
+def get_model(model_config: ModelConfig,
+              device_config: DeviceConfig,
+              lora_config: Optional[LoRAConfig] = None) -> nn.Module:
+    model_class = _get_model_architecture(model_config)
 
-    # Get the quantization config.
-    quant_config = None
+    # Get the (maybe quantized) linear method.
+    linear_method = None
     if model_config.quantization is not None:
-        if model_class not in _MODEL_CLASSES_SUPPORT_QUANTIZATION[
-                model_config.quantization]:
-            raise ValueError(
-                f"Quantization is not supported for {model_class}.")
-        quant_config = get_quant_config(model_config.quantization,
-                                        model_config.model,
-                                        model_config.hf_config,
-                                        model_config.download_dir)
+        quant_config = get_quant_config(model_config)
         capability = torch.cuda.get_device_capability()
         capability = capability[0] * 10 + capability[1]
         if capability < quant_config.get_min_capability():
@@ -73,30 +60,51 @@ def get_model(model_config: ModelConfig, max_tokens: int) -> nn.Module:
                 f"Current capability: {capability}.")
         supported_dtypes = quant_config.get_supported_act_dtypes()
         if model_config.dtype not in supported_dtypes:
-            raise ValueError(
-                f"{model_config.dtype} is not supported for quantization "
-                f"method {model_config.quantization}. Supported dtypes: "
-                f"{supported_dtypes}")
+            # set the dtype to float16 for quantized models
+            model_config.dtype = torch.float16
+            logger.warning("Model is quantized. Forcing float16 datatype.")
+        linear_method = quant_config.get_linear_method()
 
     with _set_default_torch_dtype(model_config.dtype):
         # Create a model instance.
         # The weights will be initialized as empty tensors.
-        if model_config.quantization is not None and (
-                model_class in _MODEL_CLASSES_SUPPORT_QUANTIZATION[
-                    model_config.quantization]):
-            model = model_class(model_config.hf_config, quant_config)
-        else:
-            model = model_class(model_config.hf_config)
+        with torch.device(device_config.device) if not \
+            (isinstance(linear_method, BNBLinearMethod) and
+             linear_method.quant_config.from_float) else nullcontext():
+            if hasattr(model_class, "supported_lora_modules"):
+                model = model_class(model_config.hf_config, linear_method,
+                                    lora_config)
+            elif lora_config:
+                raise ValueError(
+                    f"Model {model_class.__name__} does not support LoRA, "
+                    "but LoRA is enabled. Support for this model may "
+                    "be added in the future. If this is important to you, "
+                    "please open an issue on github.")
+            else:
+                model = model_class(model_config.hf_config, linear_method)
         if model_config.load_format == "dummy":
-            model = model.cuda()
-            # NOTE(woosuk): For accurate performance evaluation, we assign
+            # NOTE: For accurate performance evaluation, we assign
             # random values to the weights.
             initialize_dummy_weights(model)
         else:
             # Load the weights from the cached or downloaded files.
             model.load_weights(model_config.model, model_config.download_dir,
                                model_config.load_format, model_config.revision)
-            model = model.cuda()
-        if model_config.quantization is not None:
-            quant_post_init(model, max_tokens)
+        if isinstance(linear_method, BNBLinearMethod):
+            replace_quant_params(model,
+                                 quant_config=linear_method.quant_config,
+                                 modules_to_not_convert="lm_head")
+            torch.cuda.synchronize()
+            if linear_method.quant_config.from_float:
+                model = model.cuda()
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger.info("Memory allocated for converted model: {} GiB".format(
+                round(
+                    torch.cuda.memory_allocated(torch.cuda.current_device()) /
+                    (1024 * 1024 * 1024), 2)))
+            logger.info("Memory reserved for converted model: {} GiB".format(
+                round(
+                    torch.cuda.memory_reserved(torch.cuda.current_device()) /
+                    (1024 * 1024 * 1024), 2)))
     return model.eval()

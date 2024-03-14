@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional, Tuple
 
 import pytest
@@ -7,21 +8,31 @@ from transformers import AutoModelForCausalLM
 from aphrodite import LLM, SamplingParams
 from aphrodite.transformers_utils.tokenizer import get_tokenizer
 
-_TEST_PROMPTS = [
-    # pylint: disable=line-too-long
-    "Develop a detailed method for integrating a blockchain-based distributed ledger system into a pre-existing finance management application. The focus should be on ensuring security, transparency, and real-time updates of transactions.",
-    "Design an AI-powered predictive analytics engine capable of identifying trends and patterns from unstructured data sets. The engine should be adaptable to different industry requirements such as healthcare, finance, and marketing.",
-    "Construct a comprehensive model for a multi-cloud architecture that can smoothly transition between different cloud platforms (AWS, Google Cloud, Azure) without any interruption in service or loss of data.",
-    "Propose a strategy for integrating Quantum Computing capabilities into existing high-performance computing (HPC) systems. The approach should consider potential challenges and solutions of Quantum-HPC integration.",
-    "Create a robust cybersecurity framework for an Internet of Things (IoT) ecosystem. The framework should be capable of detecting, preventing, and mitigating potential security breaches.",
-    "Develop a scalable high-frequency trading algorithm that uses machine learning to predict and respond to microtrends in financial markets. The algorithm should be capable of processing real-time data and executing trades within milliseconds.",
-    "Translate the following English sentence into Japanese, French, and Swahili: 'The early bird catches the worm.'",
-]
+_TEST_DIR = os.path.dirname(__file__)
+_TEST_PROMPTS = [os.path.join(_TEST_DIR, "prompts", "example.txt")]
+_LONG_PROMPTS = [os.path.join(_TEST_DIR, "prompts", "summary.txt")]
+
+
+def _read_prompts(filename: str) -> List[str]:
+    with open(filename, "r") as f:
+        prompts = f.readlines()
+        return prompts
 
 
 @pytest.fixture
 def example_prompts() -> List[str]:
-    return _TEST_PROMPTS
+    prompts = []
+    for filename in _TEST_PROMPTS:
+        prompts += _read_prompts(filename)
+    return prompts
+
+
+@pytest.fixture
+def example_long_prompts() -> List[str]:
+    prompts = []
+    for filename in _LONG_PROMPTS:
+        prompts += _read_prompts(filename)
+    return prompts
 
 
 _STR_DTYPE_TO_TORCH_DTYPE = {
@@ -152,6 +163,9 @@ class AphroditeRunner:
         model_name: str,
         tokenizer_name: Optional[str] = None,
         dtype: str = "half",
+        disable_log_stats: bool = True,
+        tensor_parallel_size: int = 1,
+        **kwargs,
     ) -> None:
         self.model = LLM(
             model=model_name,
@@ -159,6 +173,9 @@ class AphroditeRunner:
             trust_remote_code=True,
             dtype=dtype,
             swap_space=0,
+            disable_log_stats=disable_log_stats,
+            tensor_parallel_size=tensor_parallel_size,
+            **kwargs,
         )
 
     def generate(
@@ -182,6 +199,24 @@ class AphroditeRunner:
             outputs.append((req_sample_output_ids, req_sample_output_strs))
         return outputs
 
+    def generate_w_logprobs(
+        self,
+        prompts: List[str],
+        sampling_params: SamplingParams,
+    ) -> List[Tuple[List[int], str]]:
+        assert sampling_params.logprobs is not None
+
+        req_outputs = self.model.generate(prompts,
+                                          sampling_params=sampling_params)
+        outputs = []
+        for req_output in req_outputs:
+            for sample in req_output.outputs:
+                output_str = sample.text
+                output_ids = sample.token_ids
+                output_logprobs = sample.logprobs
+            outputs.append((output_ids, output_str, output_logprobs))
+        return outputs
+
     def generate_greedy(
         self,
         prompts: List[str],
@@ -191,6 +226,20 @@ class AphroditeRunner:
         outputs = self.generate(prompts, greedy_params)
         return [(output_ids[0], output_str[0])
                 for output_ids, output_str in outputs]
+
+    def generate_greedy_logprobs(
+        self,
+        prompts: List[str],
+        max_tokens: int,
+        num_logprobs: int,
+    ) -> List[Tuple[List[int], str]]:
+        greedy_logprobs_params = SamplingParams(temperature=0.0,
+                                                max_tokens=max_tokens,
+                                                logprobs=num_logprobs)
+        outputs = self.generate_w_logprobs(prompts, greedy_logprobs_params)
+
+        return [(output_ids, output_str, output_logprobs)
+                for output_ids, output_str, output_logprobs in outputs]
 
     def generate_beam_search(
         self,

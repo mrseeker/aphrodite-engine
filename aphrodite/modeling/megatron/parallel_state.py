@@ -1,11 +1,14 @@
 # Copyright 2023 The PygmalionAI team.
 # Copyright 2023 The vLLM team.
-# pylint: disable=line-too-long
-# Adapted from https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/parallel_state.py
+# Adapted from
+# https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/parallel_state.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-"""Model and data parallel groups."""
+"""Tensor and pipeline parallel groups."""
+import contextlib
 
 import torch
+
+from aphrodite.modeling.megatron import cupy_utils
 
 # Tensor model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -84,8 +87,33 @@ def initialize_model_parallel(
             _PIPELINE_GLOBAL_RANKS = ranks
 
 
+def ensure_model_parallel_initialized(
+    tensor_model_parallel_size: int,
+    pipeline_model_parallel_size: int,
+) -> None:
+    """Helper to initialize model parallel groups if they are not initialized,
+    or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
+    values if the model parallel groups are initialized.
+    """
+    if not model_parallel_is_initialized():
+        initialize_model_parallel(tensor_model_parallel_size,
+                                  pipeline_model_parallel_size)
+        return
+
+    assert (
+        get_tensor_model_parallel_world_size() == tensor_model_parallel_size
+    ), ("tensor parallel group already initialized, but of unexpected size: "
+        f"{get_tensor_model_parallel_world_size()=} vs. "
+        f"{tensor_model_parallel_size=}")
+    assert (get_pipeline_model_parallel_world_size(
+    ) == pipeline_model_parallel_size), (
+        "pipeline parallel group already initialized, but of unexpected size: "
+        f"{get_pipeline_model_parallel_world_size()=} vs. "
+        f"{pipeline_model_parallel_size=}")
+
+
 def model_parallel_is_initialized():
-    """Check if model and data parallel groups are initialized."""
+    """Check if tensor and pipeline parallel groups are initialized."""
     return (_TENSOR_MODEL_PARALLEL_GROUP is not None
             and _PIPELINE_MODEL_PARALLEL_GROUP is not None)
 
@@ -171,10 +199,47 @@ def get_pipeline_model_parallel_prev_rank():
 
 
 def destroy_model_parallel():
-    """Set the groups to none."""
+    """Set the groups to none and destroy them."""
     global _TENSOR_MODEL_PARALLEL_GROUP
+    if _TENSOR_MODEL_PARALLEL_GROUP:
+        torch.distributed.destroy_process_group(_TENSOR_MODEL_PARALLEL_GROUP)
     _TENSOR_MODEL_PARALLEL_GROUP = None
     global _PIPELINE_MODEL_PARALLEL_GROUP
+    if _PIPELINE_MODEL_PARALLEL_GROUP:
+        torch.distributed.destroy_process_group(_PIPELINE_MODEL_PARALLEL_GROUP)
     _PIPELINE_MODEL_PARALLEL_GROUP = None
     global _PIPELINE_GLOBAL_RANKS
     _PIPELINE_GLOBAL_RANKS = None
+    # Destroy the cupy states if any.
+    cupy_utils.destroy_process_group()
+
+
+# Whether to use cupy for nccl all reduce.
+# We use cupy for all reduce when using CUDA graph, because torch.distributed
+# is not well supported by CUDA graph.
+_ENABLE_CUPY_FOR_ALL_REDUCE = False
+
+
+@contextlib.contextmanager
+def with_cupy_nccl_for_all_reduce():
+    """use CuPy nccl instead of torch.distributed for all reduce"""
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size == 1:
+        # No-op.
+        # NOTE: We don't initialize CuPy when tp_size is 1.
+        yield
+    else:
+        global _ENABLE_CUPY_FOR_ALL_REDUCE
+        old = _ENABLE_CUPY_FOR_ALL_REDUCE
+        _ENABLE_CUPY_FOR_ALL_REDUCE = True
+
+        stream = torch.cuda.current_stream()
+        with cupy_utils.set_cupy_stream(stream):
+            yield
+        _ENABLE_CUPY_FOR_ALL_REDUCE = old
+
+
+def is_cupy_nccl_enabled_for_all_reduce():
+    """check if CuPy nccl is enabled for all reduce"""
+    global _ENABLE_CUPY_FOR_ALL_REDUCE
+    return _ENABLE_CUPY_FOR_ALL_REDUCE

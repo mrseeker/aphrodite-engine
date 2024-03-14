@@ -44,8 +44,8 @@ RUN pip install ninja \
 RUN git clone https://github.com/mrseeker/aphrodite-engine.git ${STAGE_DIR}/aphrodite-engine
 RUN cd ${STAGE_DIR}/aphrodite-engine && \
         git checkout . && \
-#        git checkout tags/v0.12.3 && \
-        git checkout main && \
+        git checkout tags/v0.5.0 && \
+#        git checkout main && \
         pip install -e .
 #RUN rm -rf ${STAGE_DIR}/aphrodite-engine
 RUN python -c "import aphrodite; print(aphrodite.__version__)"

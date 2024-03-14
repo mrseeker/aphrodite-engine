@@ -1,23 +1,25 @@
 """Utilities for downloading and initializing model weights."""
 import filelock
 import glob
+import fnmatch
 import json
 import os
 from collections import defaultdict
 from typing import Any, Iterator, List, Optional, Tuple
+from loguru import logger
 
-from huggingface_hub import snapshot_download
-from safetensors.torch import load_file, save_file, safe_open
+from huggingface_hub import snapshot_download, HfFileSystem
 import numpy as np
+from safetensors.torch import load_file, save_file, safe_open
 import torch
-from tqdm.auto import tqdm
 from transformers import PretrainedConfig
+from tqdm.auto import tqdm
 
-from aphrodite.common.logger import init_logger
-from aphrodite.modeling.quantization_utils import get_quant_class
-from aphrodite.modeling.quantization_utils.base import QuantizationConfig
-
-logger = init_logger(__name__)
+from aphrodite.common.config import ModelConfig
+from aphrodite.common.logger import get_loading_progress_bar
+from aphrodite.common.gguf import GGUFReader
+from aphrodite.modeling.layers.quantization import (get_quantization_config,
+                                                    QuantizationConfig)
 
 
 class Disabledtqdm(tqdm):  # pylint: disable=inconsistent-mro
@@ -81,39 +83,42 @@ def convert_bin_to_safetensor_file(
             raise RuntimeError(f"The output tensors do not match for key {k}")
 
 
-# TODO: Move this to other place.
-def get_quant_config(
-    quantization: str,
-    model_name_or_path: str,
-    hf_config: PretrainedConfig,
-    cache_dir: Optional[str] = None,
-) -> QuantizationConfig:
-    if quantization == "gptq" and hasattr(hf_config, "quantization_config"):
-        config = hf_config.quantization_config
-        return get_quant_class(quantization).from_config(config)
-
+# TODO: Move this to another place.
+def get_quant_config(model_config: ModelConfig) -> QuantizationConfig:
+    quant_cls = get_quantization_config(model_config.quantization)
+    # Read the quantization config from the HF model config, if available.
+    # if the quantization if "gguf", we skip and return quant_cls()
+    if model_config.quantization in ["exl2", "gguf"]:
+        return quant_cls()
+    hf_quant_config = getattr(model_config.hf_config, "quantization_config",
+                              None)
+    if hf_quant_config is not None:
+        return quant_cls.from_config(hf_quant_config)
+    model_name_or_path = model_config.model
     is_local = os.path.isdir(model_name_or_path)
     if not is_local:
         # Download the config files.
-        with get_lock(model_name_or_path, cache_dir):
+        with get_lock(model_name_or_path, model_config.download_dir):
             hf_folder = snapshot_download(model_name_or_path,
+                                          revision=model_config.revision,
                                           allow_patterns="*.json",
-                                          cache_dir=cache_dir,
+                                          cache_dir=model_config.download_dir,
                                           tqdm_class=Disabledtqdm)
     else:
         hf_folder = model_name_or_path
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))
 
-    quant_cls = get_quant_class(quantization)
     quant_config_files = [
         f for f in config_files if any(
             f.endswith(x) for x in quant_cls.get_config_filenames())
     ]
     if len(quant_config_files) == 0:
-        raise ValueError(f"Cannot find the config file for {quantization}")
+        raise ValueError(
+            f"Cannot find the config file for {model_config.quantization}")
     if len(quant_config_files) > 1:
-        raise ValueError(f"Found multiple config files for {quantization}: "
-                         f"{quant_config_files}")
+        raise ValueError(
+            f"Found multiple config files for {model_config.quantization}: "
+            f"{quant_config_files}")
 
     quant_config_file = quant_config_files[0]
     with open(quant_config_file, "r") as f:
@@ -124,18 +129,42 @@ def get_quant_config(
 def prepare_hf_model_weights(
     model_name_or_path: str,
     cache_dir: Optional[str] = None,
-    use_safetensors: bool = False,
+    load_format: str = "auto",
     fall_back_to_pt: bool = True,
     revision: Optional[str] = None,
 ) -> Tuple[str, List[str], bool]:
     # Download model weights from huggingface.
     is_local = os.path.isdir(model_name_or_path)
-    if use_safetensors:
+    use_safetensors = False
+    # Some quantized models use .pt files for storing the weights.
+    if load_format == "auto":
+        allow_patterns = ["*.safetensors", "*.bin"]
+    elif load_format == "safetensors":
+        use_safetensors = True
         allow_patterns = ["*.safetensors"]
+    elif load_format == "pt":
+        allow_patterns = ["*.pt"]
+    elif load_format == "npcache":
+        allow_patterns = ["*.bin"]
     else:
-        # Some quantized models use .pt files for storing the weights.
-        allow_patterns = ["*.bin", "*.pt"]
+        raise ValueError(f"Unknown load_format: {load_format}")
+
+    if fall_back_to_pt:
+        allow_patterns += ["*.pt"]
+
     if not is_local:
+        # Before we download we look at that is available:
+        fs = HfFileSystem()
+        file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+
+        # depending on what is available we download different things
+        for pattern in allow_patterns:
+            matching = fnmatch.filter(file_list, pattern)
+            if len(matching) > 0:
+                allow_patterns = [pattern]
+                break
+
+        logger.info(f"Downloading model weights {allow_patterns}")
         # Use file lock to prevent multiple processes from
         # downloading the same model weights at the same time.
         with get_lock(model_name_or_path, cache_dir):
@@ -149,7 +178,13 @@ def prepare_hf_model_weights(
     hf_weights_files: List[str] = []
     for pattern in allow_patterns:
         hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+        if len(hf_weights_files) > 0:
+            if pattern == "*.safetensors":
+                use_safetensors = True
+            break
     if not use_safetensors:
+        # Exclude files that are not needed for inference.
+        # https://github.com/huggingface/transformers/blob/v4.34.0/src/transformers/trainer.py#L227-L233
         blacklist = [
             "training_args.bin",
             "optimizer.bin",
@@ -163,13 +198,6 @@ def prepare_hf_model_weights(
             if not any(f.endswith(x) for x in blacklist)
         ]
 
-    if len(hf_weights_files) == 0 and use_safetensors and fall_back_to_pt:
-        return prepare_hf_model_weights(model_name_or_path,
-                                        cache_dir=cache_dir,
-                                        use_safetensors=False,
-                                        fall_back_to_pt=False,
-                                        revision=revision)
-
     if len(hf_weights_files) == 0:
         raise RuntimeError(
             f"Cannot find any model weights with `{model_name_or_path}`")
@@ -177,35 +205,103 @@ def prepare_hf_model_weights(
     return hf_folder, hf_weights_files, use_safetensors
 
 
+def convert_gguf_to_state_dict(checkpoint, config):
+    if not os.path.isfile(checkpoint):
+        raise RuntimeError(
+            f"Cannot find any model weights with `{checkpoint}`")
+
+    result = GGUFReader(checkpoint)
+    # write tensor
+    kv_dim = config.hidden_size // config.num_attention_heads * config.num_key_value_heads
+    tensor_mapping = {
+        "token_embd": ("model.embed_tokens", config.vocab_size),
+        "output": ("lm_head", config.vocab_size),
+        "output_norm": ("model.norm", -1),
+        "blk.{bid}.attn_norm": ("model.layers.{bid}.input_layernorm", -1),
+        "blk.{bid}.attn_q": ("model.layers.{bid}.self_attn.q_proj",
+                             config.hidden_size),
+        "blk.{bid}.attn_k": ("model.layers.{bid}.self_attn.k_proj", kv_dim),
+        "blk.{bid}.attn_v": ("model.layers.{bid}.self_attn.v_proj", kv_dim),
+        "blk.{bid}.attn_output": ("model.layers.{bid}.self_attn.o_proj",
+                                  config.hidden_size),
+        "blk.{bid}.attn_rot_embd":
+        ("model.layers.{bid}.self_attn.rotary_emb.inv_freq", -1),
+        "blk.{bid}.ffn_norm": ("model.layers.{bid}.post_attention_layernorm",
+                               -1),
+        "blk.{bid}.ffn_up": ("model.layers.{bid}.mlp.up_proj",
+                             config.intermediate_size),
+        "blk.{bid}.ffn_down": ("model.layers.{bid}.mlp.down_proj",
+                               config.hidden_size),
+        "blk.{bid}.ffn_gate": ("model.layers.{bid}.mlp.gate_proj",
+                               config.intermediate_size),
+        "blk.{bid}.ffn_up.{xid}":
+        ("model.layers.{bid}.block_sparse_moe.experts.{xid}.w3",
+         config.intermediate_size),
+        "blk.{bid}.ffn_down.{xid}":
+        ("model.layers.{bid}.block_sparse_moe.experts.{xid}.w2",
+         config.hidden_size),
+        "blk.{bid}.ffn_gate.{xid}":
+        ("model.layers.{bid}.block_sparse_moe.experts.{xid}.w1",
+         config.intermediate_size),
+        "blk.{bid}.ffn_gate_inp": ("model.layers.{bid}.block_sparse_moe.gate",
+                                   config.num_local_experts if hasattr(
+                                       config, "num_local_experts") else -1),
+    }
+    mapping = {}
+    # This is how llama.cpp handles name mapping,
+    # it's better to use regex match instead doe
+    max_block_num = 200
+    max_expert_num = 8
+    for k, v in tensor_mapping.items():
+        for i in range(max_block_num):
+            for j in range(max_expert_num):
+                fk = k.format(bid=i, xid=j)
+                fv = v[0].format(bid=i, xid=j)
+                if k not in mapping:
+                    mapping[fk] = (fv, v[1])
+
+    state_dict = {}
+    with get_loading_progress_bar() as progress:
+        task = progress.add_task("[cyan]Converting GGUF tensors to PyTorch...",
+                                 total=len(result.tensors))
+        for ts in result.tensors:
+            weight_type = torch.tensor(int(ts.tensor_type), dtype=torch.int)
+            layer, suffix = ts.name.rsplit(".", 1)
+            new_key, output_dim = mapping[layer]
+            new_key += f".{suffix}"
+            data = torch.tensor(ts.data)
+            if output_dim != -1:
+                data = data.view(output_dim, -1)
+            if weight_type > 1:
+                state_dict[new_key.replace("weight",
+                                           "weight_type")] = weight_type
+            state_dict[new_key] = data
+            progress.update(task, advance=1)
+    return state_dict
+
+
 def hf_model_weights_iterator(
     model_name_or_path: str,
     cache_dir: Optional[str] = None,
     load_format: str = "auto",
     revision: Optional[str] = None,
+    config: Optional[PretrainedConfig] = None,
+    fall_back_to_pt: Optional[bool] = True,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
-    use_safetensors = False
-    use_np_cache = False
-    fall_back_to_pt = False
-    if load_format == "auto":
-        use_safetensors = True
-        fall_back_to_pt = True
-    elif load_format == "safetensors":
-        use_safetensors = True
-    elif load_format == "pt":
-        pass
-    elif load_format == "npcache":
-        use_np_cache = True
-    else:
-        raise ValueError(f"Unknown load_format: {load_format}")
+    if model_name_or_path.endswith("gguf"):
+        for name, param in convert_gguf_to_state_dict(model_name_or_path,
+                                                      config).items():
+            yield name, param
+        return
 
     hf_folder, hf_weights_files, use_safetensors = prepare_hf_model_weights(
         model_name_or_path,
         cache_dir=cache_dir,
-        use_safetensors=use_safetensors,
+        load_format=load_format,
         fall_back_to_pt=fall_back_to_pt,
         revision=revision)
 
-    if use_np_cache:
+    if load_format == "npcache":
         # Currently np_cache only support *.bin checkpoints
         assert use_safetensors is False
 
@@ -240,8 +336,8 @@ def hf_model_weights_iterator(
     elif use_safetensors:
         for st_file in hf_weights_files:
             with safe_open(st_file, framework="pt") as f:
-                for name in f.keys():
-                    param = f.get_slice(name)
+                for name in f.keys():  # noqa: SIM118
+                    param = f.get_tensor(name)
                     yield name, param
     else:
         for bin_file in hf_weights_files:
@@ -267,51 +363,12 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     return x
 
 
-def load_padded_tensor_parallel_vocab(
-    param: torch.Tensor,
-    loaded_weight: Any,  # `torch.Tensor` or `PySafeSlice`
-    tensor_model_parallel_rank: int,
-) -> None:
-    shard_size = param.shape[0]
-    start_idx = tensor_model_parallel_rank * shard_size
-    end_idx = (tensor_model_parallel_rank + 1) * shard_size
-    loaded_weight = loaded_weight[start_idx:end_idx]
-    loaded_weight = convert_pyslice_to_tensor(loaded_weight)
-    param.data[:loaded_weight.shape[0]].copy_(loaded_weight)
-
-
-def load_tensor_parallel_weights(
-    param: torch.Tensor,
-    loaded_weight: Any,  # `torch.Tensor` or `PySafeSlice`
-    param_name: str,
-    column_parallel_weight_names: List[str],
-    row_parallel_weight_names: List[str],
-    tensor_model_parallel_rank: int,
-) -> None:
-    for p in column_parallel_weight_names:
-        if p in param_name:
-            shard_size = param.shape[0]
-            start_idx = tensor_model_parallel_rank * shard_size
-            end_idx = (tensor_model_parallel_rank + 1) * shard_size
-            loaded_weight = loaded_weight[start_idx:end_idx]
-            break
-    for p in row_parallel_weight_names:
-        if p in param_name:
-            shard_size = param.shape[-1]
-            start_idx = tensor_model_parallel_rank * shard_size
-            end_idx = (tensor_model_parallel_rank + 1) * shard_size
-            if isinstance(loaded_weight, torch.Tensor):
-                loaded_weight = loaded_weight[..., start_idx:end_idx]
-            else:
-                index = [slice(None)] * (len(loaded_weight.get_shape()) -
-                                         1) + [slice(start_idx, end_idx)]
-                loaded_weight = loaded_weight[index]
-            break
-
-    loaded_weight = convert_pyslice_to_tensor(loaded_weight)
-    assert param.shape == loaded_weight.shape, (
-        f"{param_name} shape mismatch between model and checkpoint: "
-        f"{param.shape} != {loaded_weight.shape}")
+def default_weight_loader(param: torch.Tensor,
+                          loaded_weight: torch.Tensor) -> None:
+    """Default weight loader."""
+    if isinstance(param, torch.nn.parameter.UninitializedParameter):
+        param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+    assert param.size() == loaded_weight.size()
     param.data.copy_(loaded_weight)
 
 
@@ -330,29 +387,3 @@ def initialize_dummy_weights(
     for param in model.state_dict().values():
         if torch.is_floating_point(param):
             param.data.uniform_(low, high)
-
-
-def get_parallel_weight(model: torch.nn.Module):
-    if model.quant_config is None:
-        column_weight_suffixes = ["weight", "bias"]
-        row_weight_suffixes = ["weight"]
-    else:
-        column_weight_suffixes = (
-            model.quant_config.get_col_parallel_tensor_names())
-        row_weight_suffixes = (
-            model.quant_config.get_row_parallel_tensor_names())
-
-    column_parallel_weights: List[str] = []
-    for layer in model.column_parallel_layers:
-        for suffix in column_weight_suffixes:
-            column_parallel_weights.append(f"{layer}.{suffix}")
-    row_parallel_weights: List[str] = []
-    for layer in model.row_parallel_layers:
-        for suffix in row_weight_suffixes:
-            row_parallel_weights.append(f"{layer}.{suffix}")
-
-    if hasattr(model, "parallel_vocab_layers"):
-        for layer in model.parallel_vocab_layers:
-            for suffix in ["weight", "bias"]:
-                column_parallel_weights.append(f"{layer}.{suffix}")
-    return column_parallel_weights, row_parallel_weights

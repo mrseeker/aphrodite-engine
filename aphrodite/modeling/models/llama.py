@@ -20,11 +20,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only LLaMA model compatible with HuggingFace weights.
-
-The input of the model is flattened to a 1D tensor of tokens. The model uses
-InputMetadata to extract the original 2D shape of the input.
-"""
+"""Inference-only LLaMA model compatible with HuggingFace weights."""
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -33,19 +29,24 @@ from transformers import LlamaConfig
 
 from aphrodite.modeling.metadata import InputMetadata
 from aphrodite.modeling.layers.activation import SiluAndMul
+from aphrodite.modeling.layers.attention import PagedAttention
 from aphrodite.modeling.layers.layernorm import RMSNorm
-from aphrodite.modeling.layers.attention import PagedAttentionWithRoPE
+from aphrodite.modeling.layers.linear import (LinearMethodBase,
+                                              MergedColumnParallelLinear,
+                                              QKVParallelLinear,
+                                              RowParallelLinear,
+                                              ColumnParallelLinear)
+from aphrodite.modeling.layers.rotary_embedding import get_rope
 from aphrodite.modeling.layers.sampler import Sampler
-from aphrodite.modeling.layers.quantized_linear import ParallelLinear
+from aphrodite.modeling.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding, ParallelLMHead, DEFAULT_VOCAB_PADDING_SIZE)
 from aphrodite.modeling.megatron.parallel_state import (
-    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
-from aphrodite.modeling.megatron.layers import VocabParallelEmbedding
-from aphrodite.modeling.quantization_utils import QuantizationConfig
-from aphrodite.modeling.hf_downloader import (
-    convert_pyslice_to_tensor, hf_model_weights_iterator,
-    load_tensor_parallel_weights, load_padded_tensor_parallel_vocab,
-    get_parallel_weight)
+    get_tensor_model_parallel_world_size)
+from aphrodite.modeling.sampling_metadata import SamplingMetadata
+from aphrodite.modeling.hf_downloader import (default_weight_loader,
+                                              hf_model_weights_iterator)
 from aphrodite.common.sequence import SamplerOutput
+from aphrodite.common.config import LoRAConfig
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
@@ -57,26 +58,42 @@ class LlamaMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
-        quant_config: Optional[QuantizationConfig] = None,
+        linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = ParallelLinear.column(hidden_size,
-                                                  2 * intermediate_size,
+        if linear_method is not None and not linear_method.quant_config.merge_weight(
+        ):
+            self.merge_weight = False
+            self.gate_proj = ColumnParallelLinear(hidden_size,
+                                                  intermediate_size,
                                                   bias=False,
-                                                  gather_output=False,
-                                                  quant_config=quant_config)
-        self.down_proj = ParallelLinear.row(intermediate_size,
-                                            hidden_size,
-                                            bias=False,
-                                            input_is_parallel=True,
-                                            quant_config=quant_config)
+                                                  linear_method=linear_method)
+            self.up_proj = ColumnParallelLinear(hidden_size,
+                                                intermediate_size,
+                                                bias=False,
+                                                linear_method=linear_method)
+        else:
+            self.merge_weight = True
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size, [intermediate_size] * 2,
+                bias=False,
+                linear_method=linear_method)
+        self.down_proj = RowParallelLinear(intermediate_size,
+                                           hidden_size,
+                                           bias=False,
+                                           linear_method=linear_method)
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
+        if self.merge_weight:
+            gate_up, _ = self.gate_up_proj(x)
+        else:
+            up, _ = self.up_proj(x)
+            gate, _ = self.gate_proj(x)
+            gate_up = torch.cat([gate, up], dim=-1)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -92,7 +109,9 @@ class LlamaAttention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        quant_config: Optional[QuantizationConfig] = None,
+        linear_method: Optional[LinearMethodBase] = None,
+        bias: bool = False,
+        sliding_window: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -110,7 +129,6 @@ class LlamaAttention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        num_kv_heads_replicas = max(1, tp_size // self.total_num_kv_heads)
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -118,31 +136,53 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        self.qkv_proj = ParallelLinear.column(
-            hidden_size,
-            (self.total_num_heads +
-             2 * self.total_num_kv_heads * num_kv_heads_replicas) *
-            self.head_dim,
-            bias=False,
-            gather_output=False,
-            quant_config=quant_config,
-        )
-        self.o_proj = ParallelLinear.row(
+        if linear_method is not None and not linear_method.quant_config.merge_weight(
+        ):
+            self.merge_weight = False
+            self.q_proj = ColumnParallelLinear(hidden_size,
+                                               self.q_size,
+                                               bias=bias,
+                                               linear_method=linear_method)
+            self.k_proj = ColumnParallelLinear(hidden_size,
+                                               self.kv_size,
+                                               bias=bias,
+                                               linear_method=linear_method)
+            self.v_proj = ColumnParallelLinear(hidden_size,
+                                               self.kv_size,
+                                               bias=bias,
+                                               linear_method=linear_method)
+        else:
+            self.merge_weight = True
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=bias,
+                linear_method=linear_method,
+            )
+        self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
-            bias=False,
-            input_is_parallel=True,
-            quant_config=quant_config,
+            bias=bias,
+            linear_method=linear_method,
         )
-        self.attn = PagedAttentionWithRoPE(
-            self.num_heads,
+
+        is_neox_style = True if linear_method is None or linear_method.quant_config.rope_style(
+        ) is None else linear_method.quant_config.rope_style()
+        self.rotary_emb = get_rope(
             self.head_dim,
-            self.scaling,
-            base=self.rope_theta,
-            max_position=self.max_position_embeddings,
             rotary_dim=self.head_dim,
-            num_kv_heads=self.num_kv_heads,
-            rope_scaling=rope_scaling)
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=is_neox_style,
+        )
+        self.attn = PagedAttention(self.num_heads,
+                                   self.head_dim,
+                                   self.scaling,
+                                   num_kv_heads=self.num_kv_heads,
+                                   sliding_window=sliding_window)
 
     def forward(
         self,
@@ -150,13 +190,20 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: KVCache,
         input_metadata: InputMetadata,
-        cache_event: Optional[torch.cuda.Event],
+        kv_quant_param: List[float],
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.merge_weight:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                dim=-1)
+        else:
+            q, _ = self.q_proj(hidden_states)
+            k, _ = self.k_proj(hidden_states)
+            v, _ = self.v_proj(hidden_states)
+        q, k = self.rotary_emb(positions, q, k)
         k_cache, v_cache = kv_cache
-        attn_output = self.attn(positions, q, k, v, k_cache, v_cache,
-                                input_metadata, cache_event)
+        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata,
+                                kv_quant_param)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -166,29 +213,32 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
+        sliding_window = getattr(config, "sliding_window", None)
         self.self_attn = LlamaAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
+            num_kv_heads=getattr(config, "num_key_value_heads",
+                                 config.num_attention_heads),
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
+            linear_method=linear_method,
+            bias=getattr(config, "bias", False),
+            sliding_window=sliding_window,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
-            quant_config=quant_config,
+            linear_method=linear_method,
         )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -201,26 +251,29 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: KVCache,
         input_metadata: InputMetadata,
-        cache_event: Optional[torch.cuda.Event],
-    ) -> torch.Tensor:
+        residual: Optional[torch.Tensor],
+        kv_quant_param: List[float],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             input_metadata=input_metadata,
-            cache_event=cache_event,
+            kv_quant_param=kv_quant_param,
         )
-        hidden_states = residual + hidden_states
 
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, residual
 
 
 class LlamaModel(nn.Module):
@@ -228,20 +281,24 @@ class LlamaModel(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        linear_method: Optional[LinearMethodBase] = None,
+        lora_config: Optional[LoRAConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        vocab_size = ((config.vocab_size + 63) // 64) * 64
+        lora_vocab = (lora_config.lora_extra_vocab_size *
+                      (lora_config.max_loras or 1)) if lora_config else 0
+        self.vocab_size = config.vocab_size + lora_vocab
+        self.org_vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
-            vocab_size,
+            self.vocab_size,
             config.hidden_size,
+            linear_method=linear_method,
+            org_num_embeddings=config.vocab_size,
         )
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, quant_config)
+            LlamaDecoderLayer(config, linear_method)
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -252,45 +309,76 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
-        cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
+        residual = None
         for i in range(len(self.layers)):
-            if cache_events is None:
-                cache_event = None
-            else:
-                cache_event = cache_events[i]
             layer = self.layers[i]
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 kv_caches[i],
                 input_metadata,
-                cache_event,
+                residual,
+                input_metadata.kv_quant_params[i]
+                if input_metadata.kv_quant_params is not None else None,
             )
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
 class LlamaForCausalLM(nn.Module):
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+
+    # LoRA specific attributes
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+        "embed_tokens",
+        "lm_head",
+    ]
+    embedding_modules = {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
+    embedding_padding_modules = ["lm_head"]
 
     def __init__(
         self,
         config: LlamaConfig,
-        quant_config: Optional[QuantizationConfig] = None,
+        linear_method: Optional[LinearMethodBase] = None,
+        lora_config: Optional[LoRAConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
-        self.quant_config = quant_config
-        self.model = LlamaModel(config, quant_config)
-        vocab_size = ((config.vocab_size + 63) // 64) * 64
-        # NOTE: The LM head is not quantized.
-        self.lm_head = ParallelLinear.column(config.hidden_size,
-                                             vocab_size,
-                                             bias=False,
-                                             gather_output=False,
-                                             quant_config=None)
-        self.sampler = Sampler(config.vocab_size)
+        self.linear_method = linear_method
+        self.model = LlamaModel(config, linear_method, lora_config=lora_config)
+        self.unpadded_vocab_size = config.vocab_size
+        if lora_config:
+            self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
+        self.lm_head = ParallelLMHead(
+            self.unpadded_vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            linear_method=linear_method,
+            padding_size=DEFAULT_VOCAB_PADDING_SIZE
+            # We need bigger padding if using lora for kernel
+            # compatibility
+            if not lora_config else lora_config.lora_vocab_padding_size,
+        )
+        self.sampler = Sampler(self.unpadded_vocab_size, config.vocab_size)
 
     def forward(
         self,
@@ -298,142 +386,63 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
-        cache_events: Optional[List[torch.cuda.Event]],
-    ) -> SamplerOutput:
+    ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   input_metadata, cache_events)
-        next_tokens = self.sampler(self.lm_head.weight, hidden_states,
                                    input_metadata)
-        return next_tokens
+        return hidden_states
 
-    column_parallel_layers = []
-    row_parallel_layers = ["o_proj", "down_proj"]
+    def sample(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[SamplerOutput]:
+        next_tokens = self.sampler(self.lm_head(hidden_states),
+                                   sampling_metadata)
+        return next_tokens
 
     def load_weights(self,
                      model_name_or_path: str,
                      cache_dir: Optional[str] = None,
                      load_format: str = "auto",
                      revision: Optional[str] = None):
-        column_parallel_weights, row_parallel_weights = get_parallel_weight(
-            self)
-        column_weight_suffixes = (
-            self.quant_config.get_col_parallel_tensor_names()
-        ) if self.quant_config is not None else ["weight", "bias"]
-
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        q_proj_shard_size = (self.config.hidden_size // tp_size)
-        num_kv_heads_replicas = max(1,
-                                    tp_size // self.config.num_key_value_heads)
-        num_kv_heads_per_gpu = max(1,
-                                   self.config.num_key_value_heads // tp_size)
-        kv_proj_shard_size = (self.config.hidden_size //
-                              self.config.num_attention_heads *
-                              num_kv_heads_per_gpu)
-        attention_weight_specs = [
-            # (weight_name, shard_size, offset)
-            ("q_proj", q_proj_shard_size, 0),
-            ("k_proj", kv_proj_shard_size, q_proj_shard_size),
-            ("v_proj", kv_proj_shard_size,
-             q_proj_shard_size + kv_proj_shard_size),
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
         ]
-        state_dict = self.state_dict()
-
+        if self.linear_method is not None and not self.linear_method.quant_config.merge_weight(
+        ):
+            stacked_params_mapping = []
+        params_dict = dict(self.named_parameters())
         for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path, cache_dir, load_format, revision):
+                model_name_or_path, cache_dir, load_format, revision,
+                self.config):
             if "rotary_emb.inv_freq" in name:
                 continue
-
-            packed_dim = None
-            is_transposed = False
-            if self.quant_config is not None:
-                packed_dim = self.quant_config.get_packed_dim(name)
-                is_transposed = self.quant_config.is_transposed(name)
-            if is_transposed:
-                loaded_weight = convert_pyslice_to_tensor(loaded_weight)
-                loaded_weight = loaded_weight.T
-
-            is_attention_weight = False
-            for weight_name, shard_size, offset in attention_weight_specs:
+            if ("rotary_emb.cos_cached" in name
+                    or "rotary_emb.sin_cached" in name):
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                continue
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, "qkv_proj")
-                if name not in state_dict:  # pylint: disable=unsupported-membership-test
-                    break
-                param = state_dict[name]  # pylint: disable=unsubscriptable-object
-                if is_transposed:
-                    param = param.T
-
-                if packed_dim is not None:
-                    shard_dim = 0 if not is_transposed else 1
-                    if packed_dim == shard_dim:
-                        shard_size //= self.quant_config.pack_factor
-                        offset //= self.quant_config.pack_factor
-
-                if weight_name in ["k_proj", "v_proj"]:
-                    shard_id = tp_rank // num_kv_heads_replicas
-                else:
-                    shard_id = tp_rank
-                if any(
-                        name.endswith(suffix)
-                        for suffix in column_weight_suffixes):
-                    loaded_weight = loaded_weight[shard_size *
-                                                  shard_id:shard_size *
-                                                  (shard_id + 1)]
-                    param_slice = param.data[offset:offset + shard_size]
-                else:
-                    loaded_weight = convert_pyslice_to_tensor(loaded_weight)
-                    param_slice = param.data
-                assert param_slice.shape == loaded_weight.shape
-
-                param_slice.copy_(loaded_weight)
-                is_attention_weight = True
-                break
-            if is_attention_weight:
-                continue
-
-            is_gate_up_weight = False
-            for stride_id, weight_name in enumerate(["gate_proj", "up_proj"]):
-                if weight_name not in name:
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-                name = name.replace(weight_name, "gate_up_proj")
-                if name not in state_dict:  # pylint: disable=unsupported-membership-test
-                    break
-                param = state_dict[name]  # pylint: disable=unsubscriptable-object
-                if is_transposed:
-                    param = param.T
-
-                shard_size = param.shape[0] // 2
-                if any(
-                        name.endswith(suffix)
-                        for suffix in column_weight_suffixes):
-                    loaded_weight = loaded_weight[shard_size *
-                                                  tp_rank:shard_size *
-                                                  (tp_rank + 1)]
-                    param_slice = param.data[shard_size *
-                                             stride_id:shard_size *
-                                             (stride_id + 1)]
-                else:
-                    loaded_weight = convert_pyslice_to_tensor(loaded_weight)
-                    param_slice = param.data
-                assert param_slice.shape == loaded_weight.shape
-                param_slice.copy_(loaded_weight)
-                is_gate_up_weight = True
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
                 break
-            if is_gate_up_weight:
-                continue
-
-            if name not in state_dict:  # pylint: disable=unsupported-membership-test
-                continue
-            param = state_dict[name]  # pylint: disable=unsubscriptable-object
-            if is_transposed:
-                param = param.T
-
-            if "embed_tokens" in name or "lm_head" in name:
-                load_padded_tensor_parallel_vocab(param, loaded_weight,
-                                                  tp_rank)
-                continue
-
-            load_tensor_parallel_weights(param, loaded_weight, name,
-                                         column_parallel_weights,
-                                         row_parallel_weights, tp_rank)
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)

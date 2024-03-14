@@ -1,8 +1,9 @@
 """Sampling parameters for text generation."""
 from enum import IntEnum
 from functools import cached_property
-from typing import List, Optional, Union
-from aphrodite.common.logits_processor import LogitsProcessor
+from typing import Callable, List, Optional, Union
+
+import torch
 
 _SAMPLING_EPS = 1e-5
 
@@ -10,7 +11,13 @@ _SAMPLING_EPS = 1e-5
 class SamplingType(IntEnum):
     GREEDY = 0
     RANDOM = 1
-    BEAM = 2
+    RANDOM_SEED = 2
+    BEAM = 3
+
+
+LogitsProcessorFunc = Callable[[torch.Tensor, List[List[int]]], None]
+"""LogitsProcessorFunc takes a logits tensor and corresponding lists of
+previously generated output tokens, and modifies the logits tensor."""
 
 
 class SamplingParams:
@@ -70,6 +77,14 @@ class SamplingParams:
             Range [0, inf).
         mirostat_eta: Rate at which mirostat updates its internal surprisal
             value. Range [0, inf).
+        dynatemp_min: Minimum temperature for dynatemp sampling.
+            Range [0, inf).
+        dynatemp_max: Maximum temperature for dynatemp sampling.
+            Range [0, inf).
+        dynatemp_exponent: Exponent for dynatemp sampling. Range [0, inf).
+        smoothing_factor: Smoothing factor for Quadratic Sampling.
+        smoothing_curve: Smoothing curve for Quadratic (Cubic) Sampling.
+        seed: Random seed to use for the generation.
         use_beam_search: Whether to use beam search instead of sampling.
         length_penalty: Float that penalizes sequences based on their length.
             Used in beam search.
@@ -85,6 +100,8 @@ class SamplingParams:
         stop_token_ids: List of tokens that stop the generation when they are
             generated. The returned output will contain the stop tokens unless
             the stop tokens are sepcial tokens.
+        include_stop_str_in_output: Whether to include the stop strings in
+            output text. Defaults to False.
         ignore_eos: Whether to ignore the EOS token and continue generating
             tokens after the EOS token is generated.
         max_tokens: Maximum number of tokens to generate per output sequence.
@@ -123,19 +140,26 @@ class SamplingParams:
         mirostat_mode: int = 0,
         mirostat_tau: float = 0,
         mirostat_eta: float = 0,
+        dynatemp_min: float = 0,
+        dynatemp_max: float = 0,
+        dynatemp_exponent: float = 1,
+        smoothing_factor: float = 0.0,
+        smoothing_curve: float = 1.0,
+        seed: Optional[int] = None,
         use_beam_search: bool = False,
         length_penalty: float = 1.0,
         early_stopping: Union[bool, str] = False,
         stop: Union[None, str, List[str]] = None,
-        stop_token_ids: List[int] = None,
+        stop_token_ids: Optional[List[int]] = None,
+        include_stop_str_in_output: bool = False,
         ignore_eos: bool = False,
-        max_tokens: int = 16,
+        max_tokens: Optional[int] = 16,
         logprobs: Optional[int] = None,
         prompt_logprobs: Optional[int] = None,
         custom_token_bans: Optional[List[int]] = None,
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
-        logits_processors: List[LogitsProcessor] = None,
+        logits_processors: Optional[List[LogitsProcessorFunc]] = None,
     ) -> None:
         self.n = n
         self.best_of = best_of if best_of is not None else n
@@ -154,6 +178,12 @@ class SamplingParams:
         self.mirostat_mode = mirostat_mode
         self.mirostat_tau = mirostat_tau
         self.mirostat_eta = mirostat_eta
+        self.dynatemp_min = dynatemp_min
+        self.dynatemp_max = dynatemp_max
+        self.dynatemp_exponent = dynatemp_exponent
+        self.smoothing_factor = smoothing_factor
+        self.smoothing_curve = smoothing_curve
+        self.seed = seed
         self.use_beam_search = use_beam_search
         self.length_penalty = length_penalty
         self.early_stopping = early_stopping
@@ -163,10 +193,7 @@ class SamplingParams:
             self.stop = [stop]
         else:
             self.stop = list(stop)
-        if stop_token_ids is None:
-            self.stop_token_ids = []
-        else:
-            self.stop_token_ids = list(stop_token_ids)
+        self.stop_token_ids = stop_token_ids or []
         self.ignore_eos = ignore_eos
         self.max_tokens = max_tokens
         self.logprobs = logprobs
@@ -175,10 +202,47 @@ class SamplingParams:
         self.skip_special_tokens = skip_special_tokens
         self.spaces_between_special_tokens = spaces_between_special_tokens
         self.logits_processors = logits_processors or []
+        self.include_stop_str_in_output = include_stop_str_in_output
 
-        self.verify()
+        self.default_values = {
+            "n": 1,
+            "best_of": 1,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "repetition_penalty": 1.0,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "top_a": 0.0,
+            "min_p": 0.0,
+            "tfs": 1.0,
+            "eta_cutoff": 0.0,
+            "epsilon_cutoff": 0.0,
+            "typical_p": 1.0,
+            "mirostat_mode": 0,
+            "mirostat_tau": 0,
+            "mirostat_eta": 0,
+            "dynatemp_min": 0,
+            "dynatemp_max": 0,
+            "dynatemp_exponent": 1,
+            "smoothing_factor": 0.0,
+            "smoothing_curve": 1.0,
+            "seed": None,
+            "use_beam_search": False,
+            "length_penalty": 1.0,
+            "early_stopping": False,
+            "stop": [],
+            "stop_token_ids": [],
+            "ignore_eos": False,
+            "max_tokens": 16,
+            "logprobs": None,
+            "prompt_logprobs": None,
+            "custom_token_bans": [],
+            "skip_special_tokens": True,
+            "spaces_between_special_tokens": True,
+            "include_stop_str_in_output": False
+        }
 
-    def verify(self) -> None:
         self._verify_args()
         if self.use_beam_search:
             self._verify_beam_search()
@@ -186,6 +250,10 @@ class SamplingParams:
             self._verify_non_beam_search()
             if self.temperature < _SAMPLING_EPS:
                 # Zero temperature means greedy sampling.
+                self.top_p = 1.0
+                self.top_k = -1
+                self.min_p = 0.0
+                self.top_a = 0.0
                 self._verify_greedy_sampling()
 
     def _verify_args(self) -> None:
@@ -227,6 +295,21 @@ class SamplingParams:
         if not 0.0 <= self.typical_p <= 1.0:
             raise ValueError(
                 f"typical_p must be in (0, 1], got {self.typical_p}.")
+        if not self.dynatemp_min >= 0:
+            raise ValueError(
+                f"dynatemp_min must be non negative, got {self.dynatemp_min}.")
+        if not self.dynatemp_max >= 0:
+            raise ValueError(
+                f"dynatemp_max must be non negative, got {self.dynatemp_max}.")
+        if not self.dynatemp_exponent >= 0:
+            raise ValueError(f"dynatemp_exponent must be non negative, got "
+                             f"{self.dynatemp_exponent}.")
+        if not self.smoothing_factor >= 0:
+            raise ValueError(f"smoothing_factor must be non negative, got "
+                             f"{self.smoothing_factor}.")
+        if not self.smoothing_curve >= 1.0:
+            raise ValueError(f"smoothing_curve must larger than 1, got "
+                             f"{self.smoothing_curve}.")
         if self.mirostat_mode:
             if not self.mirostat_mode == 2:
                 raise ValueError(
@@ -238,7 +321,7 @@ class SamplingParams:
             if not self.mirostat_tau >= 0:
                 raise ValueError(
                     f"mirostat_tau must be positive, got {self.mirostat_tau}")
-        if self.max_tokens < 1:
+        if self.max_tokens is not None and self.max_tokens < 1:
             raise ValueError(
                 f"max_tokens must be at least 1, got {self.max_tokens}.")
         if self.logprobs is not None and self.logprobs < 0:
@@ -288,35 +371,15 @@ class SamplingParams:
             return SamplingType.BEAM
         if self.temperature < _SAMPLING_EPS:
             return SamplingType.GREEDY
+        if self.seed is not None:
+            return SamplingType.RANDOM_SEED
         return SamplingType.RANDOM
 
     def __repr__(self) -> str:
-        return (f"SamplingParams(n={self.n}, "
-                f"best_of={self.best_of}, "
-                f"presence_penalty={self.presence_penalty}, "
-                f"frequency_penalty={self.frequency_penalty}, "
-                f"repetition_penalty={self.repetition_penalty}, "
-                f"temperature={self.temperature}, "
-                f"top_p={self.top_p}, "
-                f"top_k={self.top_k}, "
-                f"top_a={self.top_a}, "
-                f"min_p={self.min_p}, "
-                f"tfs={self.tfs}, "
-                f"eta_cutoff={self.eta_cutoff}, "
-                f"epsilon_cutoff={self.epsilon_cutoff}, "
-                f"typical_p={self.typical_p}, "
-                f"mirostat_mode={self.mirostat_mode}, "
-                f"mirostat_tau={self.mirostat_tau}, "
-                f"mirostat_eta={self.mirostat_eta}, "
-                f"use_beam_search={self.use_beam_search}, "
-                f"length_penalty={self.length_penalty}, "
-                f"early_stopping={self.early_stopping}, "
-                f"stop={self.stop}, "
-                f"ignore_eos={self.ignore_eos}, "
-                f"max_tokens={self.max_tokens}, "
-                f"custom_token_bans={self.custom_token_bans}, "
-                f"logprobs={self.logprobs}, "
-                f"prompt_logprobs={self.prompt_logprobs}, "
-                f"skip_special_tokens={self.skip_special_tokens}, "
-                f"spaces_between_special_tokens="
-                f"{self.spaces_between_special_tokens})")
+        repr_str = "SamplingParams("
+        for param, default_value in self.default_values.items():
+            current_value = getattr(self, param)
+            if current_value != default_value:
+                repr_str += f"{param}={current_value}, "
+        repr_str = repr_str.rstrip(', ') + ")"
+        return repr_str
